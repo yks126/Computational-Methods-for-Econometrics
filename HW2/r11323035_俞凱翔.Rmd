@@ -1,0 +1,260 @@
+---
+title: "Homework.2"
+author: "Simon"
+date: "2023-04-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(dplyr)
+library(readxl)
+library(MASS)
+library(nleqslv)
+library(foreach)
+library(iterators)
+library(parallel)
+library(doParallel)
+```
+
+Question.1
+```{r}
+data <- read_xlsx("CilibertoTamerEconometrica.xlsx")
+```
+
+```{r}
+nfirm <- 6 #total firms
+nmkts <- nrow(data) #total markets
+ints <- rep(1, nmkts) #intercepts
+R <- 1000 #simulation times
+
+# X_i, Z_ik 
+X   <- cbind(ints, data$marketdistance, data$marketsize)
+AA  <- cbind(data$marketpresenceAA, data$mindistancefromhubAA)
+DL  <- cbind(data$marketpresenceDL, data$mindistancefromhubDL)
+UA  <- cbind(data$marketpresenceUA, data$mindistancefromhubUA)
+AL  <- cbind(data$marketpresenceAL, data$mindistancefromhubAL)
+WN  <- cbind(data$marketpresenceWN, data$mindistancefromhubWN)
+LCC <- cbind(data$marketpresenceLCC, data$mindistancefromhubLCC)
+
+
+X_Z <- list(cbind(X, AA),
+            cbind(X, DL),
+            cbind(X, UA),
+            cbind(X, AL),
+            cbind(X, WN),
+            cbind(X, LCC))
+```
+
+```{r}
+# Q1-1
+# Order Probit Model
+
+opm_func <- function(theta){
+
+  # set parameters
+  beta <- theta[1: ncol(X)]
+  delta <- theta[ncol(X) + 1]
+  
+  # profit function
+  pi <- X %*% beta
+  
+  # P(N* = N_i)
+  p_n_star <- data.frame(N = rowSums(data[, 2: 7])) %>% 
+    mutate(delta_log_n = ifelse(N != 0, delta * log(N), NA),
+           delta_log_n1 = ifelse(N != 0, delta * log(N + 1), NA),
+           p = case_when(N == 0 ~ pnorm(-pi),                           # N = 1
+                         N == nfirm ~ (1 - pnorm(-pi + delta_log_n)),      # N = 6
+                         TRUE ~ (pnorm(-pi + delta_log_n1) - pnorm(-pi + delta_log_n))), # N = 1,...,5
+           ln_p = log(p))
+  
+  # log likelihood function
+  llik <- sum(p_n_star$ln_p)
+  
+  return(-llik)
+}
+
+
+theta_start <- rep(1, 4)
+res <- optim(theta_start, opm_func, hessian = T)
+
+opm_par <- data.frame(theta_hat_opm = res$par,
+                      theta_hat_opm_se = solve(res$hessian) 
+                      %>% diag() %>% sqrt()) %>%
+  as.matrix() %>%
+  t() %>%
+  as.data.frame()
+
+colnames(opm_par) <- c("beta_0", "beta_1", "beta_2", "delta")
+opm_par
+```
+
+
+
+```{r}
+# Q1-2
+# set up parallel backend
+cl <- makeCluster(15)
+registerDoParallel(cl)
+
+# number of parameters
+k_par <- ncol(X) + ncol(AA) %>% as.numeric()
+
+# actual number of firms in the markets
+actual_n <- rowSums(data[, 2: 7]) %>% cbind(data[, 2: 7]) %>% t()
+
+
+# objective function
+obj_func <- function(theta){
+  
+  # set parameters
+  beta_alpha <- theta[1: k_par]
+  delta <- theta[k_par + 1]
+  rho <- theta[k_par + 2]
+  
+  
+  # profit without error and delta_ln(N)
+  pi <- lapply(X_Z, function(x) x %*% beta_alpha) %>%
+    unlist() %>%
+    matrix(ncol = 6)
+  
+  # delta_ln(N)
+  delta_ln <- delta * log(1: nfirm)
+  
+  ?foreach
+  # calculate v_i0,..., v_i6
+  v <- foreach(i = 1: nmkts, 
+               .combine = cbind,
+               .packages = "tidyverse",
+               .export = c("R", "nfirm")) %dopar% {
+
+    # n_hat and predict enter firms for market i
+    prediction <- matrix(0, nrow = R, ncol = nfirm + 1)
+    
+    # generate epsilon
+    set.seed(i)
+    u_i <- matrix(rnorm(R * (nfirm + 1)), nrow = R, ncol = nfirm + 1)
+    
+
+    # (u_i[, 2: (nfirm + 1)] * sqrt(1 - rho ^ 2) + u_i[, 1] * rho) is [e_1i, ..., e_6i], (R * nfirm) matrix
+    # pi_1, the profit with epsilon, is a (R * nfirm) matrix.
+    pi_1 <-  (u_i[, 2: (nfirm + 1)] * sqrt(1 - rho ^ 2) + u_i[, 1] * rho) %>%
+      apply(MARGIN = 1, function(x) x + pi[i, ]) %>%
+      t()
+      
+    
+    # find n_hat
+    for (l in 1: nfirm) {
+      prediction[rowSums((pi_1 - delta_ln[l]) > 0) >= l, 1] <- l
+    }
+    
+    # check whether firm k will enter the market
+    prediction[, 2: (nfirm + 1)] <- t(apply(pi_1, 1, function(x) order(x, decreasing = TRUE))) %>%
+      apply(2 , function(x) x <= prediction[, 1])
+    
+    colMeans(prediction)
+  }
+  
+  # v_i
+  v <- actual_n - v 
+  
+  
+  # moment condition
+  g_bar <- (1 / nmkts) * matrix(cbind(v[1, ] %*% X ,
+                                      v[2, ] %*% ints,
+                                      v[3, ] %*% ints,
+                                      v[4, ] %*% ints,
+                                      v[5, ] %*% ints,
+                                      v[6, ] %*% ints,
+                                      v[7, ] %*% ints))
+  
+  G <- t(g_bar) %*% g_bar %>% as.numeric()
+  
+  return(G)
+}
+
+
+# start point
+theta_start <- c(1.298865, 1.583957, 0.2347437, 2.053762, -0.1132449, 4.748535, -0.01732458)
+
+# the defualt method is Nelder-Mead
+res_2 <- optim(theta_start, obj_func, control=list(trace = 1, maxit=1000))
+
+# stop cluster
+stopCluster(cl)
+```
+
+```{r eval=FALSE, include=FALSE}
+start <- Sys.time()
+
+obj_func(theta_start)
+
+end <- Sys.time()
+
+end - start
+```
+
+```{r}
+msm_par <- data.frame(matrix(res_2$par, ncol = length(res_2$par)))
+colnames(msm_par) <- c("beta_0", "beta_1", "beta_2", "alpha_1", "alpha_2", "delta", "rho")
+msm_par
+```
+
+
+Queston.2
+```{r}
+# Q2-1
+set.seed(123)
+data_2 <- data.frame(x = rnorm(n = 2000, mean = 20, sd = 5)) %>% 
+  rbind(., data.frame(x = rnorm(n = 3000, mean = 10, sd = 3)))
+ggplot(data_2, aes(x = x)) + geom_histogram()
+```
+
+```{r}
+# Q2-2
+# make an initial guess: p = 0.5, N(0, 1), N(100, 100) 
+# theta = (mu_1, mu_2, sd_1, sd_2)
+EM_func <- function(p = 0.5, theta = c(0, 100, 1, 100), X = data_2$x, max_iter = 1000, tol_err = 10 ^ -6){
+  err <- 1
+  iter <- 0
+  
+  while (err > tol_err & iter < max_iter) {
+    # E-step
+    d1 <- dnorm(X, mean = theta[1], sd = theta[3])
+    d2 <- dnorm(X, mean = theta[2], sd = theta[4])
+    omega <- d1 * p / (d1 * p  + d2 *(1 - p)) 
+    
+    # M-step
+    p_new <- mean(omega)
+    theta_new <- c(sum(X * omega) / sum(omega),  
+                   sum(X * (1 - omega)) / sum(1 - omega),    
+                   sqrt(sum((X - theta[1]) ^ 2 * omega) / sum(omega)),            
+                   sqrt(sum((X - theta[2]) ^ 2 * (1 - omega)) / sum(1 - omega)))
+
+    # calculate error to check convergence
+    err <- t(theta - theta_new) %*% (theta - theta_new) %>% sqrt()
+    p <- p_new
+    theta <- theta_new
+    
+    iter <- iter + 1
+  }
+  
+  return(data.frame(p = p, 
+                    mu_1 = theta[1], 
+                    sd_1 = theta[3], 
+                    mu_2 = theta[2], 
+                    sd_2 = theta[4], 
+                    n_iter = iter, 
+                    err = err))
+}
+
+EM_func()
+```
